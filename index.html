@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ubicación en tiempo real - Avanzado</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+  <style>
+    body{padding:1rem}
+    #map{width:100%;height:65vh;border-radius:8px;border:1px solid #ddd}
+    .controls{gap:8px;display:flex;align-items:center;flex-wrap:wrap}
+    .sidebar{max-width:360px}
+    .user-list{max-height:250px;overflow:auto}
+  </style>
+</head>
+<body class="container">
+  <h1 class="mb-3">Ubicación en tiempo real — Avanzado</h1>
+  <div class="row">
+    <div class="col-md-4 sidebar mb-3">
+      <div class="card p-3 mb-3">
+        <h5>Conectar</h5>
+        <div class="mb-2">
+          <input id="name" class="form-control" placeholder="Tu nombre (ej: Eduardo)">
+        </div>
+        <div class="mb-2 controls">
+          <button id="registerBtn" class="btn btn-primary">Registrar / Obtener token</button>
+          <button id="connectBtn" class="btn btn-success" disabled>Conectar</button>
+        </div>
+        <div class="mb-2">
+          <small class="text-muted">Token:</small>
+          <textarea id="token" class="form-control" rows="2" readonly></textarea>
+        </div>
+        <div class="mb-2">
+          <label>Room: <input id="room" class="form-control" value="sala1"></label>
+        </div>
+        <div class="mb-2">
+          <button id="historyBtn" class="btn btn-outline-secondary">Descargar historial (JSON)</button>
+        </div>
+      </div>
+
+      <div class="card p-3 mb-3">
+        <h6>Usuarios conectados</h6>
+        <ul id="users" class="list-group user-list"></ul>
+      </div>
+
+      <div class="card p-3">
+        <h6>Opciones</h6>
+        <div class="form-check mb-2">
+          <input class="form-check-input" type="checkbox" id="showPaths" checked>
+          <label class="form-check-label" for="showPaths">Mostrar rutas (polylines)</label>
+        </div>
+        <div class="mb-2">
+          <small class="text-muted">Precisión mínima (m)</small>
+          <input id="minAccuracy" class="form-control" type="number" value="50">
+        </div>
+        <div>
+          <small class="text-muted">Última actualización:</small>
+          <div id="lastUpdate">—</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-md-8">
+      <div id="map"></div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const API_BASE = (location.protocol + '//' + location.hostname + ':8080');
+    const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':8080';
+
+    // Mapa
+    const map = L.map('map').setView([20.5, -97.0], 6);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+    const markers = {}; // clientId -> marker
+    const polylines = {}; // clientId -> polyline (array)
+    const userMeta = {}; // clientId -> {name, lastTs}
+
+    let ws = null;
+    let watchId = null;
+    let myClientId = null;
+    let myToken = '';
+
+    // UI elements
+    const registerBtn = document.getElementById('registerBtn');
+    const connectBtn = document.getElementById('connectBtn');
+    const historyBtn = document.getElementById('historyBtn');
+    const nameInput = document.getElementById('name');
+    const tokenArea = document.getElementById('token');
+    const roomInput = document.getElementById('room');
+    const usersList = document.getElementById('users');
+    const showPathsChk = document.getElementById('showPaths');
+    const minAccuracyInput = document.getElementById('minAccuracy');
+    const lastUpdate = document.getElementById('lastUpdate');
+
+    registerBtn.onclick = async () => {
+      const name = nameInput.value.trim();
+      if (!name) return alert('Pon un nombre');
+      try {
+        const res = await fetch(API_BASE + '/register', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ name })
+        });
+        const data = await res.json();
+        if (!res.ok) return alert(data.error || 'Error al registrar');
+        myToken = data.token;
+        tokenArea.value = myToken;
+        connectBtn.disabled = false;
+        alert('Registro exitoso. Guarda tu token.');
+      } catch (e) { alert('Error de red: ' + e.message) }
+    };
+
+    connectBtn.onclick = async () => {
+      if (!myToken) return alert('Primero obtén tu token (Registrar)');
+      const room = roomInput.value || 'sala1';
+      ws = new WebSocket(WS_URL);
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type:'auth', token: myToken, room }));
+        startSharing();
+      };
+      ws.onmessage = (ev) => {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'location') handleLocation(msg);
+        if (msg.type === 'meta') updateUsers(msg.users);
+        if (msg.type === 'welcome') myClientId = msg.clientId;
+      };
+      ws.onclose = () => { stopSharing(); alert('Conexión cerrada'); };
+      connectBtn.disabled = true;
+    };
+
+    historyBtn.onclick = async () => {
+      if (!myToken) return alert('Regístrate primero');
+      try {
+        const res = await fetch(API_BASE + '/history?token=' + encodeURIComponent(myToken));
+        if (!res.ok) throw new Error('No se pudo descargar historial');
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'historial.json'; a.click();
+        URL.revokeObjectURL(url);
+      } catch (e) { alert(e.message) }
+    };
+
+    function updateUsers(list) {
+      usersList.innerHTML = '';
+      list.forEach(u => {
+        const li = document.createElement('li');
+        li.className = 'list-group-item';
+        li.innerText = u.name + (u.id === myClientId ? ' (tú)' : '');
+        usersList.appendChild(li);
+      });
+    }
+
+    function handleLocation(msg) {
+      const id = msg.clientId;
+      const lat = msg.lat, lng = msg.lng, ts = msg.ts, name = msg.name, acc = msg.accuracy || 0;
+      userMeta[id] = { name, lastTs: ts };
+      lastUpdate.innerText = new Date(ts).toLocaleString();
+
+      if (!markers[id]) {
+        markers[id] = L.marker([lat,lng]).addTo(map);
+        markers[id].bindPopup(`${name || id}`);
+        polylines[id] = L.polyline([[lat,lng]]).addTo(map);
+      } else {
+        markers[id].setLatLng([lat,lng]).setPopupContent(`${name || id}`);
+        if (showPathsChk.checked) polylines[id].addLatLng([lat,lng]);
+      }
+      if (id === myClientId) {
+        map.setView([lat,lng], 15);
+      }
+    }
+
+    function startSharing() {
+      if (!navigator.geolocation) return alert('Geolocation no soportado');
+      watchId = navigator.geolocation.watchPosition((pos) => {
+        const acc = pos.coords.accuracy || 0;
+        const minAcc = Number(minAccuracyInput.value) || 100;
+        if (acc > minAcc) return; // ignorar lecturas poco precisas
+        const lat = pos.coords.latitude, lng = pos.coords.longitude, ts = pos.timestamp;
+        // enviar por WS
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type:'location', lat, lng, ts, accuracy: acc }));
+        }
+      }, (err) => {
+        console.error(err); alert('Error geolocation: ' + err.message);
+      }, { enableHighAccuracy:true, maximumAge:3000, timeout:10000 });
+    }
+
+    function stopSharing() {
+      if (watchId) navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+      if (ws) ws.close();
+      connectBtn.disabled = false;
+    }
+
+  </script>
+</body>
+</html>
